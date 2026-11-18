@@ -1,0 +1,17 @@
+name: Check nginx_updater shell script
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  posix-sh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check POSIX sh syntax
+        run: sh -n nginx-updater.sh
+      - name: Check help and status commands
+        run: |
+          sh nginx-updater.sh --help
+          sh nginx-updater.sh --status
