@@ -1,8 +1,8 @@
 #!/bin/sh
-# nginx_updater: safe APT-based installer/updater for official nginx packages.
+# nginx_updater: safely detects and updates the active APT or Docker Compose nginx.
 set -eu
 
-VERSION=1.2.0
+VERSION=1.3.0
 BACKUP_ROOT=/var/backups/nginx-updater
 KEYRING=/usr/share/keyrings/nginx-archive-keyring.gpg
 REPO_LIST=/etc/apt/sources.list.d/nginx.list
@@ -75,7 +75,7 @@ docker_overview() {
 }
 
 
-# Explicit Docker Compose nginx update. Never invoked by --auto (APT).
+# Docker Compose nginx update: explicit by name or selected by --auto when unambiguous.
 docker_rollback() {
     info "Проверка после обновления не прошла; возвращаю $OLD_IMAGE."
     if cp -p "$BACKUP_DIR/original-compose.yml" "$COMPOSE_FILE" &&
@@ -451,6 +451,64 @@ update_nginx() {
     info 'Проверь HTTPS на реальных доменах и доступность прокси извне.'
 }
 
+# Автоматически определяем, какой nginx РЕАЛЬНО используется на сервере.
+# Если есть неопределённость, не меняем ни APT, ни Docker.
+auto_update() {
+    need_root
+    info 'Определяю активный nginx: системная служба или Docker.'
+    DOCKER_CANDIDATES=
+    if command -v docker >/dev/null 2>&1; then
+        docker info >/dev/null 2>&1 || fail 'Docker установлен, но daemon недоступен. Не могу проверить контейнеры безопасно.'
+        DOCKER_CANDIDATES=$(docker ps --format '{{.Names}}|{{.Image}}' |
+            awk -F'|' 'tolower($1 "|" $2) ~ /nginx/ {print $1}') ||
+            fail 'Не удалось получить список контейнеров Docker.'
+    fi
+    SYSTEM_ACTIVE=no
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet nginx; then
+        SYSTEM_ACTIVE=yes
+    fi
+    COUNT=0
+    if [ -n "$DOCKER_CANDIDATES" ]; then
+        COUNT=$(printf '%s\n' "$DOCKER_CANDIDATES" | awk 'NF {n++} END {print n+0}')
+    fi
+    if [ "$COUNT" -gt 1 ]; then
+        runtime_overview
+        fail 'Найдено несколько nginx-контейнеров. Укажи нужный: --docker-update ИМЯ.'
+    fi
+    if [ "$COUNT" -eq 1 ]; then
+        if [ "$SYSTEM_ACTIVE" = yes ]; then
+            runtime_overview
+            fail 'Работают и nginx.service, и nginx в Docker. Выбери --stable (APT) или --docker-update ИМЯ.'
+        fi
+        # Не пропускаем nginx, запущенный нестандартным способом вне выбранного контейнера.
+        for PID in $(nginx_pids); do
+            [ -d "/proc/$PID" ] || continue
+            ORIGIN=$(nginx_process_origin "$PID")
+            [ "$ORIGIN" = container ] || {
+                runtime_overview
+                fail "Помимо Docker обнаружен ещё nginx PID=$PID ($ORIGIN). Нужен явный выбор."
+            }
+        done
+        SELECTED=$(printf '%s\n' "$DOCKER_CANDIDATES" | awk 'NF {print; exit}')
+        info "Выбран работающий Docker-nginx: $SELECTED. APT-пакет менять не буду."
+        docker_update "$SELECTED" ""
+        return
+    fi
+    # Если контейнер не найден, но nginx есть вне systemd, нельзя делать вид,
+    # что это запущенный системный пакет nginx.
+    if has_non_system_nginx; then
+        runtime_overview
+        fail 'Найден nginx вне systemd nginx.service, но его контейнер не опознан. Автоматически не обновляю.'
+    fi
+    if nginx_installed; then
+        info 'Найден установленный системный nginx. Использую APT.'
+        update_nginx "$(branch_from_repo)" update
+        return
+    fi
+    runtime_overview
+    fail 'Не найден однозначный nginx для обновления. Для новой установки системного nginx используй --install.'
+}
+
 check_updates() {
     need_root
     apt-get update
@@ -460,7 +518,7 @@ check_updates() {
 menu() {
     while :; do
         printf '\n===== nginx_updater %s =====\n' "$VERSION"
-        printf '1) Статус nginx, Docker и портов\n2) Проверить доступные обновления\n3) Обновить установленный nginx stable\n4) Обновить установленный nginx mainline\n5) Проверить nginx -t и подключённые конфиги\n6) Создать резервную копию\n7) Показать резервные копии\n8) Диагностика HTTP/2, портов и модулей\n9) Информация о nginx в Docker\n10) Новая установка системного nginx stable\n11) Обновить nginx в Docker\n0) Выход\nВыбор: '
+        printf '1) Статус nginx, Docker и портов\n2) Проверить доступные обновления\n3) Обновить установленный nginx stable\n4) Обновить установленный nginx mainline\n5) Проверить nginx -t и подключённые конфиги\n6) Создать резервную копию\n7) Показать резервные копии\n8) Диагностика HTTP/2, портов и модулей\n9) Информация о nginx в Docker\n10) Новая установка системного nginx stable\n11) Обновить nginx в Docker\n12) Автоматически обновить работающий nginx (APT или Docker)\n0) Выход\nВыбор: '
         read -r CHOICE || return 0
         case "$CHOICE" in
             1) status ;;
@@ -474,6 +532,7 @@ menu() {
             9) docker_overview ;;
             10) printf 'Для новой установки системного nginx напиши INSTALL: '; read -r CONFIRM || return 0; [ "$CONFIRM" = INSTALL ] && update_nginx stable install || info 'Отменено' ;;
             11) printf 'Имя nginx-контейнера: '; read -r D_NAME || return 0; printf 'Тег (Enter = последняя stable-alpine): '; read -r D_TARGET || return 0; docker_update "$D_NAME" "$D_TARGET" ;;
+            12) auto_update ;;
             0) return 0 ;;
             *) info 'Неизвестная команда' ;;
         esac
@@ -482,9 +541,9 @@ menu() {
 
 usage() {
     cat <<'EOF'
-nginx_updater — управляемое обновление системного nginx через nginx.org.
+nginx_updater — автоопределение активного nginx (APT или Docker Compose).
 Запуск: sudo sh nginx-updater.sh [команда]
-  --auto          Обновить установленный nginx; ветка nginx.org сохраняется (по умолчанию)
+  --auto          Найти активный nginx и обновить через APT или Docker Compose (по умолчанию)
   --stable        Обновить установленный nginx stable
   --mainline      Обновить установленный nginx mainline
   --install       Установить системный nginx stable с нуля (не запускать, не включать)
@@ -499,15 +558,15 @@ nginx_updater — управляемое обновление системног
   --backup        Создать резервную копию /etc/nginx
   --help          Показать справку
 
-Безопасность: --auto больше НЕ устанавливает nginx, если его нет в APT.
-При обнаружении nginx в Docker или других внешних процессах изменение системного пакета
-блокируется. Docker-обновление запускается только явно: --docker-update NAME [IMAGE].
+Безопасность: --auto выбирает APT или единственный nginx-контейнер Docker.
+Если несколько активных nginx или неоднозначная установка, прекращает работу.
+Новая установка системного nginx только через --install. Docker можно обновить явно.
 Поддержка: Ubuntu 22.04/24.04/26.04, Debian 12/13; amd64/arm64.
 EOF
 }
 
 case "${1:---auto}" in
-    --auto) update_nginx "$(branch_from_repo)" update ;;
+    --auto) auto_update ;;
     --stable) update_nginx stable update ;;
     --mainline) update_nginx mainline update ;;
     --install) update_nginx stable install ;;
