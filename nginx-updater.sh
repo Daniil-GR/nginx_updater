@@ -2,7 +2,7 @@
 # nginx_updater: safely detects and updates the active APT or Docker Compose nginx.
 set -eu
 
-VERSION=1.3.0
+VERSION=1.3.1
 BACKUP_ROOT=/var/backups/nginx-updater
 KEYRING=/usr/share/keyrings/nginx-archive-keyring.gpg
 REPO_LIST=/etc/apt/sources.list.d/nginx.list
@@ -226,15 +226,48 @@ runtime_overview() {
 
 runtime_preflight() {
     MODE=$1
-    if has_non_system_nginx || has_docker_nginx; then
-        runtime_overview
-        fail 'Обнаружен nginx, запущенный вне nginx.service (например, Docker). Не меняю системный пакет: это не обновит работающий контейнер. Используй --docker-status и проверь конфигурацию Compose.'
+    # Не допускаем ложных отрицательных результатов при недоступном Docker daemon.
+    if command -v docker >/dev/null 2>&1; then
+        docker info >/dev/null 2>&1 ||
+            fail 'Docker установлен, но daemon недоступен. Проверка параллельных nginx невозможна.'
+        docker ps --format '{{.Names}}|{{.Image}}' >/dev/null 2>&1 ||
+            fail 'Не удалось получить список Docker-контейнеров.'
     fi
+
+    CONTAINER_NGINX=no
+    if has_docker_nginx; then CONTAINER_NGINX=yes; fi
+
+    # Обход по процессам необходим: имя Docker-контейнера может не содержать "nginx".
+    for CHECK_PID in $(nginx_pids); do
+        [ -d "/proc/$CHECK_PID" ] || continue
+        CHECK_ORIGIN=$(nginx_process_origin "$CHECK_PID")
+        case "$CHECK_ORIGIN" in
+            systemd) ;;
+            container) CONTAINER_NGINX=yes ;;
+            *)
+                runtime_overview
+                fail "nginx PID=$CHECK_PID запущен вне nginx.service/Docker (тип: $CHECK_ORIGIN). Обновление системного пакета небезопасно."
+                ;;
+        esac
+    done
+
     if [ "$MODE" = install ]; then
-        command -v ss >/dev/null 2>&1 || fail 'Не найден ss: нельзя безопасно проверить порты 80/443 перед установкой.'
+        [ "$CONTAINER_NGINX" = no ] ||
+            fail 'Работает контейнерный nginx. Не устанавливаю второй системный nginx.'
+        command -v ss >/dev/null 2>&1 ||
+            fail 'Не найден ss: нельзя безопасно проверить порты 80/443 перед установкой.'
         BUSY=$(ss -H -lntp 2>/dev/null | awk '$4 ~ /:80$|:443$/ {print}' || true)
         [ -z "$BUSY" ] || fail "Порты 80 или 443 уже заняты. Не устанавливаю дополнительный nginx:
 $BUSY"
+    elif [ "$MODE" = update ] && [ "$CONTAINER_NGINX" = yes ]; then
+        # На нодах с CDN (nginx.service) и Selfsteal (Docker) обновляем только
+        # уже работающий системный nginx. Не запускаем неиспользуемый пакет.
+        if ! command -v systemctl >/dev/null 2>&1 ||
+           ! systemctl is-active --quiet nginx; then
+            runtime_overview
+            fail 'Есть Docker-nginx, но системный nginx.service не активен. Не обновляю неиспользуемый APT-пакет.'
+        fi
+        info 'Обнаружен также Docker-nginx. Обновляю ТОЛЬКО активный системный nginx; Docker не изменяю.'
     fi
 }
 
