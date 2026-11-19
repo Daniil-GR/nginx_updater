@@ -2,7 +2,7 @@
 # nginx_updater: safe APT-based installer/updater for official nginx packages.
 set -eu
 
-VERSION=1.0.0
+VERSION=1.1.0
 BACKUP_ROOT=/var/backups/nginx-updater
 KEYRING=/usr/share/keyrings/nginx-archive-keyring.gpg
 REPO_LIST=/etc/apt/sources.list.d/nginx.list
@@ -14,6 +14,97 @@ info() { printf '[nginx-updater] %s\n' "$*"; }
 fail() { printf '[nginx-updater] ОШИБКА: %s\n' "$*" >&2; exit 1; }
 need_root() { [ "$(id -u)" -eq 0 ] || fail 'Для этой команды нужен root. Запусти через sudo sh nginx-updater.sh ...'; }
 nginx_installed() { dpkg-query -W -f='${Status}' nginx 2>/dev/null | grep -qx 'install ok installed'; }
+
+
+# Изучаем работающие nginx до ЛЮБОЙ установки или обновления.
+# На хосте /proc/<pid>/exe у контейнера тоже может быть /usr/sbin/nginx:
+# только readlink недостаточно. Проверяем cgroup и список Docker.
+nginx_pids() {
+    if command -v ps >/dev/null 2>&1; then
+        ps -eo pid=,comm= | awk '$2=="nginx" {print $1}'
+    fi
+}
+
+nginx_process_origin() {
+    PID=$1
+    CG=$(cat "/proc/$PID/cgroup" 2>/dev/null || true)
+    case "$CG" in
+        *docker-*|*/docker/*|*containerd*|*kubepods*|*libpod*|*podman*) printf container ;;
+        */nginx.service|*/nginx.service/*) printf systemd ;;
+        *) printf external ;;
+    esac
+}
+
+has_non_system_nginx() {
+    for PID in $(nginx_pids); do
+        [ -d "/proc/$PID" ] || continue
+        ORIGIN=$(nginx_process_origin "$PID")
+        [ "$ORIGIN" = systemd ] || return 0
+    done
+    return 1
+}
+
+has_docker_nginx() {
+    if command -v docker >/dev/null 2>&1; then
+        docker ps --format '{{.Names}}|{{.Image}}' 2>/dev/null | grep -iq nginx
+    else
+        return 1
+    fi
+}
+
+docker_overview() {
+    if ! command -v docker >/dev/null 2>&1; then
+        info 'Docker CLI не найден.'
+        return 0
+    fi
+    info 'Запущенные Docker-контейнеры, связанные с nginx:'
+    CONTAINERS=$(docker ps --format '{{.Names}}|{{.Image}}' 2>/dev/null | grep -i nginx || true)
+    if [ -z "$CONTAINERS" ]; then
+        info 'Контейнеров с nginx в имени/образе не найдено.'
+        return 0
+    fi
+    printf '%s\n' "$CONTAINERS" | while IFS='|' read -r NAME IMAGE; do
+        [ -n "$NAME" ] || continue
+        printf '  %s — %s\n' "$NAME" "$IMAGE"
+        docker exec "$NAME" nginx -v 2>&1 | sed 's/^/    /' || true
+        # Этикетки Compose помогают определить, откуда следует обновлять контейнер.
+        META=$(docker inspect -f 'project={{index .Config.Labels "com.docker.compose.project"}} service={{index .Config.Labels "com.docker.compose.service"}}' "$NAME" 2>/dev/null || true)
+        [ -z "$META" ] || printf '    %s\n' "$META"
+    done
+    info 'APT не обновляет контейнерные образы. Для обновления Docker требуется отдельное изменение образа/Compose и пересоздание контейнера.'
+}
+
+runtime_overview() {
+    info 'Процессы nginx на хосте (с учётом контейнеров):'
+    FOUND=no
+    for PID in $(nginx_pids); do
+        [ -d "/proc/$PID" ] || continue
+        FOUND=yes
+        printf '  PID %s: %s\n' "$PID" "$(nginx_process_origin "$PID")"
+    done
+    [ "$FOUND" = yes ] || info 'Процессы nginx не найдены.'
+    info 'Слушающие TCP-порты 80/443:'
+    if command -v ss >/dev/null 2>&1; then
+        ss -H -lntp 2>/dev/null | awk '$4 ~ /:80$|:443$/ {print}' || true
+    else
+        info 'ss недоступен.'
+    fi
+    docker_overview
+}
+
+runtime_preflight() {
+    MODE=$1
+    if has_non_system_nginx || has_docker_nginx; then
+        runtime_overview
+        fail 'Обнаружен nginx, запущенный вне nginx.service (например, Docker). Не меняю системный пакет: это не обновит работающий контейнер. Используй --docker-status и проверь конфигурацию Compose.'
+    fi
+    if [ "$MODE" = install ]; then
+        command -v ss >/dev/null 2>&1 || fail 'Не найден ss: нельзя безопасно проверить порты 80/443 перед установкой.'
+        BUSY=$(ss -H -lntp 2>/dev/null | awk '$4 ~ /:80$|:443$/ {print}' || true)
+        [ -z "$BUSY" ] || fail "Порты 80 или 443 уже заняты. Не устанавливаю дополнительный nginx:
+$BUSY"
+    fi
+}
 
 check_platform() {
     [ -r /etc/os-release ] || fail 'Не удалось определить ОС.'
@@ -37,20 +128,26 @@ branch_from_repo() {
 
 status() {
     info "nginx_updater $VERSION"
-    if command -v nginx >/dev/null 2>&1; then nginx -v 2>&1; else info 'nginx не найден в PATH'; fi
     if nginx_installed; then
+        info 'Установленный системный nginx:'
         dpkg-query -W -f='Пакет: ${binary:Package} ${Version}\n' nginx
+        if command -v nginx >/dev/null 2>&1; then nginx -v 2>&1; fi
     else
-        info 'Системный пакет nginx не установлен'
+        info 'Системный пакет nginx через APT не установлен.'
+        if command -v nginx >/dev/null 2>&1; then
+            info 'Предупреждение: nginx найден в PATH, но не числится установленным через dpkg.'
+            nginx -v 2>&1
+        fi
     fi
     if command -v apt-cache >/dev/null 2>&1; then
         apt-cache policy nginx | sed -n '1,12p'
     fi
     if command -v systemctl >/dev/null 2>&1; then
-        info "Служба: $(systemctl is-active nginx 2>/dev/null || true)"
-        info "Автозапуск: $(systemctl is-enabled nginx 2>/dev/null || true)"
+        info "nginx.service: $(systemctl is-active nginx 2>/dev/null || true)"
+        info "Автозапуск nginx.service: $(systemctl is-enabled nginx 2>/dev/null || true)"
     fi
-    info "Ветка репозитория: $(branch_from_repo) (если настроен через nginx-updater)"
+    info "Ветка репозитория: $(branch_from_repo)"
+    runtime_overview
 }
 
 validate() {
@@ -61,13 +158,16 @@ validate() {
 }
 
 diagnose() {
-    validate
-    info 'Настройки HTTP/2:'
-    nginx -T 2>&1 | grep -nE 'listen .*http2|^[[:space:]]*http2[[:space:]]+(on|off)' || true
-    info 'Прослушиваемые порты nginx:'
-    if command -v ss >/dev/null 2>&1; then ss -lntp | grep nginx || true; fi
-    info 'Загруженные динамические модули:'
-    nginx -T 2>&1 | grep -E '^[[:space:]]*load_module ' || true
+    runtime_overview
+    if nginx_installed; then
+        validate
+        info 'Настройки HTTP/2 в системном nginx:'
+        nginx -T 2>&1 | grep -nE 'listen .*http2|^[[:space:]]*http2[[:space:]]+(on|off)' || true
+        info 'Загруженные динамические модули:'
+        nginx -T 2>&1 | grep -E '^[[:space:]]*load_module ' || true
+    else
+        info 'Системный nginx не установлен — проверка его nginx -t не выполняется.'
+    fi
 }
 
 backup() {
@@ -135,17 +235,31 @@ EOF
 update_nginx() {
     need_root
     BRANCH=$1
+    ACTION=$2
     check_platform
     if command -v nginx >/dev/null 2>&1 && ! nginx_installed; then
-        fail 'Найден nginx, установленный не через dpkg. Автоматическое обновление запрещено.'
+        runtime_overview
+        fail 'Найден nginx, не установленный через dpkg. Автоматическая установка/замена запрещена.'
     fi
+    if [ "$ACTION" = update ] && ! nginx_installed; then
+        runtime_overview
+        fail 'Системного nginx нет. --auto не устанавливает второй nginx. Для новой установки без конфликтующих процессов используй --install.'
+    fi
+    if [ "$ACTION" = install ] && nginx_installed; then
+        fail 'Системный nginx уже установлен. Используй --auto, --stable или --mainline.'
+    fi
+    runtime_preflight "$ACTION"
     if nginx_installed; then
         nginx -t || fail 'Текущая конфигурация содержит ошибки. Сначала исправь nginx -t.'
     fi
     check_modules_before_switch
     if apt-mark showhold | grep -qx nginx; then fail 'nginx находится на hold (apt-mark). Сними блокировку вручную.'; fi
     WAS_ACTIVE=no
-    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet nginx; then WAS_ACTIVE=yes; fi
+    WAS_ENABLED=no
+    if command -v systemctl >/dev/null 2>&1; then
+        if systemctl is-active --quiet nginx; then WAS_ACTIVE=yes; fi
+        if systemctl is-enabled --quiet nginx; then WAS_ENABLED=yes; fi
+    fi
     BEFORE_SITES=0
     if nginx_installed; then
         BEFORE_SITES=$(nginx -T 2>&1 | grep -c '^# configuration file /etc/nginx/sites-enabled/' || true)
@@ -183,13 +297,25 @@ update_nginx() {
     if [ "$AFTER_SITES" -lt "$BEFORE_SITES" ]; then
         fail "После обновления стало меньше активных sites-enabled ($BEFORE_SITES -> $AFTER_SITES). Резерв: $BACKUP_DIR. Службу не перезапускаю."
     fi
-    if command -v systemctl >/dev/null 2>&1 && [ "$WAS_ACTIVE" = yes ]; then
+    if command -v systemctl >/dev/null 2>&1; then
         systemctl daemon-reload
-        systemctl restart nginx || fail 'nginx не запустился. Проверь journalctl -u nginx -n 100.'
-        systemctl is-active --quiet nginx || fail 'nginx неактивен после обновления.'
+        if [ "$ACTION" = install ]; then
+            # Установщик пакета может включить службу сам: отменяем это.
+            systemctl disable --now nginx || fail 'Не удалось отключить автоматически созданную службу nginx.'
+            info 'Новая установка: nginx.service отключён и не будет запускаться после перезагрузки.'
+        elif [ "$WAS_ACTIVE" = yes ]; then
+            systemctl restart nginx || fail 'nginx не запустился. Проверь journalctl -u nginx -n 100.'
+            systemctl is-active --quiet nginx || fail 'nginx неактивен после обновления.'
+        fi
+        if [ "$ACTION" = update ] && [ "$WAS_ENABLED" = no ]; then
+            systemctl disable nginx || fail 'Не удалось сохранить отключённый автозапуск nginx.'
+            if [ "$WAS_ACTIVE" = no ] && systemctl is-active --quiet nginx; then
+                systemctl stop nginx || fail 'nginx неожиданно запустился во время обновления, не удалось его остановить.'
+            fi
+        fi
     fi
     info "Успешно: $(nginx -v 2>&1). Резервная копия: $BACKUP_DIR"
-    if [ "$WAS_ACTIVE" = no ]; then info "Ранее служба была остановлена; явный запуск не выполнялся. Текущий статус: $(systemctl is-active nginx 2>/dev/null || true)"; fi
+    if [ "$WAS_ACTIVE" = no ]; then info "До операции служба была остановлена; текущее состояние: $(systemctl is-active nginx 2>/dev/null || true)"; fi
     info 'Проверь HTTPS на реальных доменах и доступность прокси извне.'
 }
 
@@ -202,17 +328,19 @@ check_updates() {
 menu() {
     while :; do
         printf '\n===== nginx_updater %s =====\n' "$VERSION"
-        printf '1) Статус nginx и APT\n2) Проверить доступные обновления\n3) Обновить/установить nginx stable\n4) Обновить/установить nginx mainline\n5) Проверить nginx -t и подключённые конфиги\n6) Создать резервную копию\n7) Показать резервные копии\n8) Диагностика HTTP/2, портов и модулей\n0) Выход\nВыбор: '
+        printf '1) Статус nginx, Docker и портов\n2) Проверить доступные обновления\n3) Обновить установленный nginx stable\n4) Обновить установленный nginx mainline\n5) Проверить nginx -t и подключённые конфиги\n6) Создать резервную копию\n7) Показать резервные копии\n8) Диагностика HTTP/2, портов и модулей\n9) Информация о nginx в Docker\n10) Новая установка системного nginx stable\n0) Выход\nВыбор: '
         read -r CHOICE || return 0
         case "$CHOICE" in
             1) status ;;
             2) check_updates ;;
-            3) update_nginx stable ;;
-            4) printf 'Для перехода на mainline напиши MAINLINE: '; read -r CONFIRM || return 0; [ "$CONFIRM" = MAINLINE ] && update_nginx mainline || info 'Отменено' ;;
+            3) update_nginx stable update ;;
+            4) printf 'Для перехода на mainline напиши MAINLINE: '; read -r CONFIRM || return 0; [ "$CONFIRM" = MAINLINE ] && update_nginx mainline update || info 'Отменено' ;;
             5) validate ;;
             6) backup ;;
             7) ls -lht "$BACKUP_ROOT" 2>/dev/null || info 'Резервных копий пока нет' ;;
             8) diagnose ;;
+            9) docker_overview ;;
+            10) printf 'Для новой установки системного nginx напиши INSTALL: '; read -r CONFIRM || return 0; [ "$CONFIRM" = INSTALL ] && update_nginx stable install || info 'Отменено' ;;
             0) return 0 ;;
             *) info 'Неизвестная команда' ;;
         esac
@@ -221,31 +349,36 @@ menu() {
 
 usage() {
     cat <<'EOF'
-nginx_updater — автоматическая установка/обновление nginx через nginx.org.
+nginx_updater — управляемое обновление системного nginx через nginx.org.
 Запуск: sudo sh nginx-updater.sh [команда]
-  --auto       Обновить nginx; сохранить текущую ветку nginx.org, иначе stable (по умолчанию)
-  --stable     Установить/обновить официальный nginx stable
-  --mainline   Установить/обновить официальный nginx mainline
-  --menu       Интерактивное меню
-  --status     Показать версии, APT и состояние службы
-  --check      Обновить индексы APT и показать доступные версии
-  --test       nginx -t и список загруженных конфигураций
-  --diagnose   Проверка HTTP/2, модулей и прослушиваемых портов
-  --backup     Создать резервную копию /etc/nginx
-  --help       Показать справку
+  --auto          Обновить установленный nginx; ветка nginx.org сохраняется (по умолчанию)
+  --stable        Обновить установленный nginx stable
+  --mainline      Обновить установленный nginx mainline
+  --install       Установить системный nginx stable с нуля (не запускать, не включать)
+  --menu          Интерактивное меню
+  --status        Показать APT, Docker, процессы и порты
+  --docker-status Обнаружить контейнеры с nginx и показать их версии/Compose
+  --check         Обновить индексы APT и показать доступные версии
+  --test          nginx -t для системного nginx и список конфигураций
+  --diagnose      Проверка HTTP/2, модулей и прослушиваемых портов
+  --backup        Создать резервную копию /etc/nginx
+  --help          Показать справку
 
-Внимание: nginx в Docker, NGINX Plus и сборки из исходников не обновляются.
-Ubuntu: 22.04, 24.04, 26.04; Debian: 12, 13. Режим --auto не обновляет другие пакеты ОС,
-кроме необходимых зависимостей. Установка может кратковременно прервать соединения.
+Безопасность: --auto больше НЕ устанавливает nginx, если его нет в APT.
+При обнаружении nginx в Docker или других внешних процессах изменение системного пакета
+блокируется. Контейнеры автоматически НЕ обновляются: нужно обновить тег образа/Compose.
+Поддержка: Ubuntu 22.04/24.04/26.04, Debian 12/13; amd64/arm64.
 EOF
 }
 
 case "${1:---auto}" in
-    --auto) update_nginx "$(branch_from_repo)" ;;
-    --stable) update_nginx stable ;;
-    --mainline) update_nginx mainline ;;
+    --auto) update_nginx "$(branch_from_repo)" update ;;
+    --stable) update_nginx stable update ;;
+    --mainline) update_nginx mainline update ;;
+    --install) update_nginx stable install ;;
     --menu) menu ;;
     --status) status ;;
+    --docker-status) docker_overview ;;
     --check) check_updates ;;
     --test) validate ;;
     --diagnose) diagnose ;;
