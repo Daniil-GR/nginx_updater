@@ -459,9 +459,10 @@ auto_update() {
     DOCKER_CANDIDATES=
     if command -v docker >/dev/null 2>&1; then
         docker info >/dev/null 2>&1 || fail 'Docker установлен, но daemon недоступен. Не могу проверить контейнеры безопасно.'
-        DOCKER_CANDIDATES=$(docker ps --format '{{.Names}}|{{.Image}}' |
-            awk -F'|' 'tolower($1 "|" $2) ~ /nginx/ {print $1}') ||
+        DOCKER_PS=$(docker ps --format '{{.Names}}|{{.Image}}') ||
             fail 'Не удалось получить список контейнеров Docker.'
+        DOCKER_CANDIDATES=$(printf '%s\n' "$DOCKER_PS" |
+            awk -F'|' 'tolower($1 "|" $2) ~ /nginx/ {print $1}')
     fi
     SYSTEM_ACTIVE=no
     if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet nginx; then
