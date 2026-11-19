@@ -13,6 +13,8 @@ jobs:
         run: sh -n nginx-updater.sh
       - name: Test automatic target selection (APT / Docker / ambiguous)
         run: sh tests/test-auto.sh
+      - name: Test mixed APT and Docker nginx preflight
+        run: sh tests/test-mixed-nginx.sh
       - name: Check help and status commands
         run: |
           sh nginx-updater.sh --help
