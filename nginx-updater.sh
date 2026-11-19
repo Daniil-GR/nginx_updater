@@ -2,7 +2,7 @@
 # nginx_updater: safely detects and updates the active APT or Docker Compose nginx.
 set -eu
 
-VERSION=1.3.1
+VERSION=1.3.2
 BACKUP_ROOT=/var/backups/nginx-updater
 KEYRING=/usr/share/keyrings/nginx-archive-keyring.gpg
 REPO_LIST=/etc/apt/sources.list.d/nginx.list
@@ -552,7 +552,7 @@ check_updates() {
 menu() {
     while :; do
         printf '\n===== nginx_updater %s =====\n' "$VERSION"
-        printf '1) Статус nginx, Docker и портов\n2) Проверить доступные обновления\n3) Обновить установленный nginx stable\n4) Обновить установленный nginx mainline\n5) Проверить nginx -t и подключённые конфиги\n6) Создать резервную копию\n7) Показать резервные копии\n8) Диагностика HTTP/2, портов и модулей\n9) Информация о nginx в Docker\n10) Новая установка системного nginx stable\n11) Обновить nginx в Docker\n12) Автоматически обновить работающий nginx (APT или Docker)\n0) Выход\nВыбор: '
+        printf '1) Статус nginx, Docker и портов\n2) Проверить доступные обновления\n3) Обновить установленный nginx stable\n4) Обновить установленный nginx mainline\n5) Проверить nginx -t и подключённые конфиги\n6) Создать резервную копию\n7) Показать резервные копии\n8) Диагностика HTTP/2, портов и модулей\n9) Информация о nginx в Docker\n10) Новая установка системного nginx stable\n11) Обновить nginx в Docker\n12) Автоматически обновить работающий nginx (APT или Docker)\n13) Обновить только системный nginx (сохранить ветку)\n0) Выход\nВыбор: '
         read -r CHOICE || return 0
         case "$CHOICE" in
             1) status ;;
@@ -567,6 +567,7 @@ menu() {
             10) printf 'Для новой установки системного nginx напиши INSTALL: '; read -r CONFIRM || return 0; [ "$CONFIRM" = INSTALL ] && update_nginx stable install || info 'Отменено' ;;
             11) printf 'Имя nginx-контейнера: '; read -r D_NAME || return 0; printf 'Тег (Enter = последняя stable-alpine): '; read -r D_TARGET || return 0; docker_update "$D_NAME" "$D_TARGET" ;;
             12) auto_update ;;
+            13) update_nginx "$(branch_from_repo)" update ;;
             0) return 0 ;;
             *) info 'Неизвестная команда' ;;
         esac
@@ -578,6 +579,7 @@ usage() {
 nginx_updater — автоопределение активного nginx (APT или Docker Compose).
 Запуск: sudo sh nginx-updater.sh [команда]
   --auto          Найти активный nginx и обновить через APT или Docker Compose (по умолчанию)
+  --system-update Обновить только системный nginx; сохранить ветку nginx.org (иначе stable)
   --stable        Обновить установленный nginx stable
   --mainline      Обновить установленный nginx mainline
   --install       Установить системный nginx stable с нуля (не запускать, не включать)
@@ -601,6 +603,7 @@ EOF
 
 case "${1:---auto}" in
     --auto) auto_update ;;
+    --system-update) update_nginx "$(branch_from_repo)" update ;;
     --stable) update_nginx stable update ;;
     --mainline) update_nginx mainline update ;;
     --install) update_nginx stable install ;;
